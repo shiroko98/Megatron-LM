@@ -17,6 +17,7 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+from tqdm import tqdm
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
@@ -169,6 +170,7 @@ def pretrain(
     model_provider,
     model_type,
     forward_step_func,
+    get_train_iters,
     process_non_loss_data_func=None,
     extra_args_provider=None,
     args_defaults={},
@@ -212,8 +214,21 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks
     )
 
+    # import debugpy
+    # rank = torch.distributed.get_rank()
+    # debug_rank = int(os.getenv('DEBUG_RANK', '-1'))
+    # try:
+    #     if rank == debug_rank:
+    #         # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+    #         debugpy.listen(("localhost", 9501))
+    #         print("Waiting for debugger attach")
+    #         debugpy.wait_for_client()
+    # except Exception as e:
+    #     pass
+
     args = get_args()
     timers = get_timers()
+    get_train_iters()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -672,7 +687,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad, interval_time):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -755,6 +770,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
+                             iteration)
+            wandb_writer.log({'kTokens_total': args.consumed_train_samples * args.seq_length/1000},
                              iteration)
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate', learning_rate, iteration)
@@ -842,6 +859,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                                   elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
+                                 iteration)
+                wandb_writer.log({'kTokens_per_sec': args.global_batch_size * args.seq_length / 1000 / interval_time},
                                  iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
@@ -1075,7 +1094,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if one_logger:
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
-
+    progress_bar = tqdm(total=args.train_iters, initial=iteration, desc="Training Progress")  # 初始化tqdm进度条
+    last_interval_time = 0.0
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
@@ -1109,6 +1129,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         iteration += 1
+        iterval_time = progress_bar.format_dict['elapsed'] - last_interval_time
+        last_interval_time = progress_bar.format_dict['elapsed']
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
                      get_num_microbatches()
@@ -1135,7 +1157,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad, iterval_time)
+        if args.rank == (args.world_size - 1):
+            progress_bar.n = iteration
+            progress_bar.refresh()  # 刷新进度条显示
 
         # StragglerDetector
         if iteration % args.log_interval == 0 and args.log_straggler:
@@ -1257,6 +1282,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
 
+    progress_bar.close()  # 完成训练后关闭进度条
     one_logger_utils.track_e2e_metrics()
 
     # Flush TensorBoard, WandB writers and one-logger
@@ -1311,6 +1337,7 @@ def evaluate(forward_step_func,
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
+        progress_bar = tqdm(total=args.train_iters, initial=iteration, desc="Training Progress")  # 初始化tqdm进度条
         while iteration < args.eval_iters:
             iteration += 1
             if verbose:
@@ -1361,6 +1388,10 @@ def evaluate(forward_step_func,
                 if done:
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
+            if args.rank == (args.world_size - 1):
+                progress_bar.n = iteration
+                progress_bar.refresh()  # 刷新进度条显示
+
 
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
@@ -1385,6 +1416,7 @@ def evaluate(forward_step_func,
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
+    progress_bar.close()  # 完成训练后关闭进度条
 
     return total_loss_dict, collected_non_loss_data, False
 
